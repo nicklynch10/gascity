@@ -4763,3 +4763,160 @@ func TestOrderCheckNeverRunEventOrderReadsOnlyPastTheHead(t *testing.T) {
 		})
 	}
 }
+
+// --- gc order check last-run provenance (city-ipkr) -------------------------
+//
+// `elapsed` in a check row is elapsed-since-last-RUN, but before city-ipkr the
+// row did not say WHICH record supplied that instant. The two records are the
+// order.fired event (a fast path consulted only while the order is inside its
+// interval) and the order-run tracking bead (the authoritative history). The
+// fixtures below pin the three outcomes a reader can see, because the event
+// shortcut is self-disqualifying exactly when a row becomes interesting: a late
+// order is outside its interval, so it can only be resolved from order-run
+// history.
+//
+// Times are relative to a fixed `now` and the tracking bead is seeded through
+// NewMemStoreFrom so its CreatedAt is in the past; MemStore.Create would stamp
+// it with the wall clock. Fixture (c) keeps its run seconds-old rather than
+// minutes-old so it stays inside the interval even if the test binary runs with
+// GC_TEST_BACKSTOP_SPEEDUP, which divides cooldown intervals by up to 30.
+func TestOrderCheckLastRunProvenance(t *testing.T) {
+	const scoped = "sweep"
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+
+	type checkRow struct {
+		Due           bool   `json:"due"`
+		Reason        string `json:"reason"`
+		LastRun       string `json:"last_run"`
+		LastRunSource string `json:"last_run_source"`
+	}
+
+	runCheck := func(t *testing.T, runAt time.Time, firedAt time.Time, withRun bool, withEvent bool) (checkRow, string, int) {
+		t.Helper()
+		var store beads.Store = beads.NewMemStore()
+		if withRun {
+			store = beads.NewMemStoreFrom(1, []beads.Bead{{
+				ID:        "trk-1",
+				Title:     "order:" + scoped,
+				Status:    "open",
+				CreatedAt: runAt,
+				UpdatedAt: runAt,
+				Labels:    []string{"order-run:" + scoped, "order-tracking"},
+			}}, nil)
+		}
+		spy := events.NewFake()
+		if withEvent {
+			spy.Record(events.Event{Type: events.OrderFired, Subject: scoped, Ts: firedAt, Actor: "test"})
+		}
+		aa := []orders.Order{{Name: scoped, Trigger: "cooldown", Interval: "1h"}}
+		resolver := func(orders.Order) ([]beads.OrdersStore, error) {
+			return []beads.OrdersStore{{Store: store}}, nil
+		}
+
+		// The exit code is "some order is due", 1 when none: fixture (c) is
+		// legitimately not due, so the code is only checked against the row.
+		var js, table, stderr bytes.Buffer
+		code := doOrderCheckWithStoresResolverScopedJSON("", nil, aa, now, spy, resolver, true, &js, &stderr)
+		if stderr.Len() > 0 {
+			t.Fatalf("stderr: %s", stderr.String())
+		}
+		var got orderCheckJSON
+		if err := json.Unmarshal(js.Bytes(), &got); err != nil {
+			t.Fatalf("unmarshal check json: %v; raw: %s", err, js.String())
+		}
+		if len(got.Orders) != 1 {
+			t.Fatalf("orders = %d, want 1; raw: %s", len(got.Orders), js.String())
+		}
+		r := checkRow{
+			Due:           got.Orders[0].Due,
+			Reason:        got.Orders[0].Reason,
+			LastRun:       got.Orders[0].LastRun,
+			LastRunSource: got.Orders[0].LastRunSource,
+		}
+		tableCode := doOrderCheckWithStoresResolverScopedJSON("", nil, aa, now, spy, resolver, false, &table, &stderr)
+		if (tableCode == 0) != got.AnyDue {
+			t.Fatalf("text exit %d disagrees with json any_due=%v; table:\n%s", tableCode, got.AnyDue, table.String())
+		}
+		return r, table.String(), code
+	}
+
+	// (a) A late cooldown order. Its newest order.fired is OLDER than its
+	// interval, so the event shortcut refuses and the row must be reported from
+	// order-run history — with the tracking bead's own CreatedAt, not the event.
+	t.Run("late order reports order-run from the tracking bead", func(t *testing.T) {
+		runAt := now.Add(-3 * time.Hour)
+		firedAt := runAt.Add(time.Second)
+		got, table, code := runCheck(t, runAt, firedAt, true, true)
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (the order is due)", code)
+		}
+
+		if !got.Due {
+			t.Fatalf("due = false, want true; reason: %s", got.Reason)
+		}
+		if got.LastRunSource != orderCheckLastRunSourceOrderRun {
+			t.Fatalf("last_run_source = %q, want %q", got.LastRunSource, orderCheckLastRunSourceOrderRun)
+		}
+		want := runAt.Format(time.RFC3339Nano)
+		if got.LastRun != want {
+			t.Fatalf("last_run = %q, want the tracking bead CreatedAt %q (NOT the event %q)",
+				got.LastRun, want, firedAt.Format(time.RFC3339Nano))
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, got.LastRun); err != nil || !parsed.Equal(runAt) {
+			t.Fatalf("last_run %q does not parse back to %s (err %v)", got.LastRun, runAt, err)
+		}
+		for _, want := range []string{"LAST RUN", "SRC", orderCheckLastRunSourceOrderRun} {
+			if !strings.Contains(table, want) {
+				t.Fatalf("table missing %q:\n%s", want, table)
+			}
+		}
+	})
+
+	// (b) An order with no run evidence at all. Both fields stay absent (the
+	// JSON omits them) rather than claiming an epoch or inventing a source;
+	// the order is due because a cooldown order that never ran always is.
+	t.Run("no run evidence leaves last_run absent", func(t *testing.T) {
+		got, table, code := runCheck(t, time.Time{}, time.Time{}, false, false)
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (the order is due)", code)
+		}
+
+		if !got.Due {
+			t.Fatalf("due = false, want true (never run); reason: %s", got.Reason)
+		}
+		if got.LastRun != "" || got.LastRunSource != "" {
+			t.Fatalf("last_run=%q source=%q, want both absent", got.LastRun, got.LastRunSource)
+		}
+		if !strings.Contains(got.Reason, "never run") {
+			t.Fatalf("reason = %q, want it to say never run", got.Reason)
+		}
+		if !strings.Contains(table, "-") {
+			t.Fatalf("table should render an absent last run as -:\n%s", table)
+		}
+	})
+
+	// (c) An order inside its interval. The event shortcut applies, and the row
+	// must say so: a reader who sees "event" knows the value is the fired
+	// event's instant and is inside the interval by construction.
+	t.Run("in-interval order reports event", func(t *testing.T) {
+		firedAt := now.Add(-time.Second)
+		runAt := firedAt.Add(-time.Second)
+		got, table, code := runCheck(t, runAt, firedAt, true, true)
+		if code != 1 {
+			t.Fatalf("exit = %d, want 1 (no order is due)", code)
+		}
+
+		if got.Due {
+			t.Fatalf("due = true, want false (inside the interval); reason: %s", got.Reason)
+		}
+		if got.LastRunSource != orderCheckLastRunSourceEvent {
+			t.Fatalf("last_run_source = %q, want %q", got.LastRunSource, orderCheckLastRunSourceEvent)
+		}
+		if want := firedAt.Format(time.RFC3339Nano); got.LastRun != want {
+			t.Fatalf("last_run = %q, want the order.fired instant %q", got.LastRun, want)
+		}
+		if !strings.Contains(table, orderCheckLastRunSourceEvent) {
+			t.Fatalf("table missing the event source:\n%s", table)
+		}
+	})
+}

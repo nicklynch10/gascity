@@ -19,7 +19,20 @@
           "scoped_name": { "type": "string" },
           "trigger": { "type": "string" },
           "due": { "type": "boolean" },
-          "reason": { "type": "string" }
+          "reason": { "type": "string" },
+          "last_run": {
+            "type": "string",
+            "description": "The instant the reason's elapsed was measured from, RFC3339Nano. Omitted when there is no run evidence at all."
+          },
+          "last_run_source": {
+            "type": "string",
+            "enum": ["event", "order-run"],
+            "description": "Which record supplied last_run: the order.fired event shortcut (only while the order is inside its interval) or the newest order-run tracking bead."
+          },
+          "inapplicable": {
+            "type": "string",
+            "description": "Set to \"backend <name>\" when the order's requires_backend rules out its scope's backend; such an order is never due."
+          }
         },
         "additionalProperties": true
       }

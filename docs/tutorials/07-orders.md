@@ -124,13 +124,22 @@ To check which orders are due right now:
 ```shell
 ~/my-city
 $ gc order check
-NAME                 TRIGGER      DUE   REASON
-pancakes-check       cooldown     yes   never run
+NAME                 TRIGGER      DUE   LAST RUN                       SRC       REASON
+pancakes-check       cooldown     yes   -                              -         never run
 ```
 
+`LAST RUN` is when the order last *ran* and `SRC` names the record that instant
+came from — `event` for the newest `order.fired` event (only while the order is
+still inside its interval), `order-run` for the newest order-run tracking bead
+(the authoritative history, and the only source once an order is overdue), and
+`-` when there is no run evidence at all.
+
 If the orchestrator has already ticked since you saved the file, the order has
-fired once, and its row reads `no` with a reason such as
-`cooldown: 4m31s remaining`.
+fired once, and its row reads `no` with a timestamp in `LAST RUN`, `event` in
+`SRC`, and a reason such as `cooldown: 4m31s remaining`. Once the cooldown runs
+out the same order reads `yes` with `SRC` flipping to `order-run`: a row that is
+due is by definition outside its interval, so it can only be reported from run
+history. The two records agree to within about a second.
 
 ## Running an order manually
 
@@ -628,10 +637,10 @@ release-notes        formula  cron         0 9 * * 1       worker
 
 ~/my-city
 $ gc order check
-NAME                 TRIGGER      DUE   REASON
-lint-check           cooldown     yes   never run
-pancakes-check       cooldown     no    cooldown: 3m12s remaining
-release-notes        cron         no    cron: schedule not matched
+NAME                 TRIGGER      DUE   LAST RUN                       SRC       REASON
+lint-check           cooldown     yes   -                              -         never run
+pancakes-check       cooldown     no    2026-04-08T09:11:48.2Z         event     cooldown: 3m12s remaining
+release-notes        cron         no    2026-04-06T09:00:00Z           order-run cron: schedule not matched
 ```
 
 As before, the built-in orders appear too, and the cooldown reasons depend on

@@ -3153,6 +3153,33 @@ Evaluate trigger conditions for all orders and show which are due.
 Prints a table with each order's trigger, due status, and reason. Returns
 exit code 0 if any order is due, 1 if none are due.
 
+LAST RUN is when the order last RAN, not when it last fired an event, and SRC
+names the record that instant came from:
+
+  event      the newest order.fired event for this order. This record is
+             consulted only while the order is still inside its interval, so
+             a row can only carry this source when it is not yet due.
+  order-run  the newest order-run tracking bead, which is the authoritative
+             run history and the only source consulted once an order is
+             outside its interval.
+  -          no run evidence at all: the order has never run, or its trigger
+             (event/manual/webhook/condition) reports no elapsed-since-run.
+
+Two consequences worth knowing before cross-checking a row against the event
+log. First, every row whose reason reads "elapsed X &gt;= interval Y" is by
+definition outside its interval and therefore reports order-run, even though
+an order.fired event exists for it — the event is not what the elapsed value
+was measured from. Second, the two sources agree to within about a second in
+the normal case (OrderFired is recorded just before the tracking bead is
+created), so a sub-second difference between a row's LAST RUN and the newest
+order.fired event is expected and not a defect.
+
+The event log is read as a bounded newest-first tail (2000 order.fired
+events). An order whose last fired event has fallen outside that tail simply
+resolves from order-run history instead; because the event shortcut can only
+ever produce an early "not due", the bound can move a row's SRC but cannot
+change whether it is due.
+
 ```
 gc order check [flags]
 ```

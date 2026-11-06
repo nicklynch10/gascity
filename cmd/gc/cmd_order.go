@@ -176,7 +176,34 @@ func newOrderCheckCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Evaluate trigger conditions for all orders and show which are due.
 
 Prints a table with each order's trigger, due status, and reason. Returns
-exit code 0 if any order is due, 1 if none are due.`,
+exit code 0 if any order is due, 1 if none are due.
+
+LAST RUN is when the order last RAN, not when it last fired an event, and SRC
+names the record that instant came from:
+
+  event      the newest order.fired event for this order. This record is
+             consulted only while the order is still inside its interval, so
+             a row can only carry this source when it is not yet due.
+  order-run  the newest order-run tracking bead, which is the authoritative
+             run history and the only source consulted once an order is
+             outside its interval.
+  -          no run evidence at all: the order has never run, or its trigger
+             (event/manual/webhook/condition) reports no elapsed-since-run.
+
+Two consequences worth knowing before cross-checking a row against the event
+log. First, every row whose reason reads "elapsed X >= interval Y" is by
+definition outside its interval and therefore reports order-run, even though
+an order.fired event exists for it — the event is not what the elapsed value
+was measured from. Second, the two sources agree to within about a second in
+the normal case (OrderFired is recorded just before the tracking bead is
+created), so a sub-second difference between a row's LAST RUN and the newest
+order.fired event is expected and not a defect.
+
+The event log is read as a bounded newest-first tail (2000 order.fired
+events). An order whose last fired event has fallen outside that tail simply
+resolves from order-run history instead; because the event shortcut can only
+ever produce an early "not due", the bound can move a row's SRC but cannot
+change whether it is due.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if cmdOrderCheck(jsonOutput, stdout, stderr) != 0 {
@@ -1181,10 +1208,110 @@ type orderCheckJSONRow struct {
 	Trigger    string `json:"trigger"`
 	Due        bool   `json:"due"`
 	Reason     string `json:"reason"`
+	// LastRun is the resolved instant the `elapsed` in Reason was measured
+	// from, as RFC3339Nano, and LastRunSource says which record supplied it:
+	// "event" for the order.fired event shortcut, "order-run" for the
+	// order-run tracking bead. Empty/omitted when there is no run evidence at
+	// all (Reason then reads "never run", or the order is not time-triggered).
+	//
+	// These exist because `elapsed` alone is unreadable: the event shortcut
+	// applies only while the order is INSIDE its interval, so the moment an
+	// order is late enough to be worth escalating the shortcut is
+	// self-disqualifying and the value necessarily comes from the tracking
+	// bead instead. A reader cross-checking `elapsed` against the newest
+	// order.fired in the event log therefore sees a sub-second difference on a
+	// path the field never took, and concludes it is lying. Surfacing the
+	// source makes the provenance checkable instead of inferable.
+	LastRun       string `json:"last_run,omitempty"`
+	LastRunSource string `json:"last_run_source,omitempty"`
 	// Inapplicable is set ("backend <name>") when the order's requires_backend
 	// rules out its scope's backend. Such an order is never due: the
 	// dispatcher does not run it there.
 	Inapplicable string `json:"inapplicable,omitempty"`
+}
+
+// Last-run provenance values reported by order check. Each names the record
+// the resolved instant came from; see orderCheckJSONRow.LastRunSource.
+const (
+	orderCheckLastRunSourceEvent    = "event"
+	orderCheckLastRunSourceOrderRun = "order-run"
+)
+
+// orderCheckLastRun is the outcome of the most recent lastRunFn call for one
+// order: the instant, which record supplied it, and whether a run history
+// read actually happened. A closure cannot return extra values, so the
+// resolver records this as a side effect and order check reads it back.
+type orderCheckLastRun struct {
+	at     time.Time
+	source string
+}
+
+// orderCheckFormatLastRun renders the resolved instant as RFC3339Nano, or ""
+// when there is no run evidence (a never-run order) so the JSON field is
+// omitted rather than claiming an epoch.
+func orderCheckFormatLastRun(prov *orderCheckLastRun) string {
+	if prov == nil || prov.source == "" {
+		return ""
+	}
+	return prov.at.Format(time.RFC3339Nano)
+}
+
+// orderCheckSourceOf returns the provenance label, or "" when the instant has
+// no record behind it.
+func orderCheckSourceOf(prov *orderCheckLastRun) string {
+	if prov == nil {
+		return ""
+	}
+	return prov.source
+}
+
+// newOrderCheckLastRunFn builds the lastRunFn for one order and returns it
+// alongside a pointer to the provenance it records.
+//
+// The two sources are, in order of preference:
+//
+//  1. "event" — the newest order.fired event for the order, returned ONLY
+//     while now.Sub(t) < interval. This is a fast path, not the authority.
+//  2. "order-run" — orders.LastRunAcross, the newest order-run tracking bead.
+//
+// The shortcut being interval-bounded is why the source matters: for every
+// order late enough to print "elapsed X >= interval Y", condition 1 is false
+// by construction, so the row is necessarily reported from source 2. That is
+// expected behavior, not a fallback; it is documented rather than "fixed"
+// because a late order still gets the right instant either way (the two agree
+// to within ~1s — OrderFired is recorded before the tracking bead is created).
+func newOrderCheckLastRunFn(a orders.Order, now time.Time, latestFired map[string]time.Time, baseLastRunFn orders.LastRunFunc, lastRunErr *error) (orders.LastRunFunc, *orderCheckLastRun) {
+	prov := &orderCheckLastRun{}
+	// The closure MUTATES the pointed-to struct rather than assigning a fresh
+	// pointer: assigning a new pointer would only rebind the closure's own
+	// variable and the caller's copy would keep seeing the empty zero value.
+	fn := func(orderName string) (time.Time, error) {
+		if t, ok := latestFired[orderName]; ok && !t.IsZero() {
+			if a.Trigger == "cooldown" {
+				if interval, err := time.ParseDuration(a.Interval); err == nil && interval > 0 {
+					if now.Sub(t) < interval {
+						*prov = orderCheckLastRun{at: t, source: orderCheckLastRunSourceEvent}
+						return t, nil
+					}
+				}
+			}
+		}
+		last, err := baseLastRunFn(orderName)
+		if err != nil {
+			*lastRunErr = err
+			return last, err
+		}
+		// A zero time is "no run evidence at all", which is reported as an
+		// absent source: calling a never-run order "order-run" would imply a
+		// tracking bead exists.
+		if last.IsZero() {
+			*prov = orderCheckLastRun{}
+			return last, nil
+		}
+		*prov = orderCheckLastRun{at: last, source: orderCheckLastRunSourceOrderRun}
+		return last, nil
+	}
+	return fn, prov
 }
 
 func doOrderCheckJSON(aa []orders.Order, now time.Time, lastRunFn orders.LastRunFunc, jsonOutput bool, stdout, stderr io.Writer) int {
@@ -1306,6 +1433,20 @@ func doOrderCheckWithStoresResolverScoped(cityPath string, cfg *config.City, aa 
 // matches; it never opens the gzipped archives, which is where the unbounded
 // List spent its time. A log holding fewer than this many order.fired events
 // is still walked to its start.
+//
+// SRC/last_run_source is the observable consequence of this design, and the
+// bound is deliberately visible in it. The reported instant is always "when
+// the order last RAN": the event shortcut is consulted only while
+// now.Sub(event) < interval, so it can only ever answer "not due"; an order
+// late enough to be reported due is necessarily resolved from order-run
+// history, and its SRC reads "order-run" (or is absent when no tracking bead
+// exists at all). So the tail bound can change which SOURCE a row reports —
+// evicting an order's event moves that row from "event" to "order-run" — while
+// leaving due/not-due untouched, because everything the shortcut could have
+// said was already "not due". A reader who sees an order's SRC flip after a
+// busy period is seeing the bound work as designed, not a scheduler change;
+// the two sources agree to ~1s because OrderFired is emitted just before the
+// tracking bead is created.
 const orderCheckFiredEventTailLimit = 2000
 
 func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City, aa []orders.Order, now time.Time, ep events.Provider, resolveStores orderStoresResolver, jsonOutput bool, stdout, stderr io.Writer) int {
@@ -1374,22 +1515,7 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 			frontDoors := orderFrontDoorsForTypedStores(typedStores)
 			baseLastRunFn := orders.LastRunAcross(frontDoors)
 			var lastRunErr error
-			lastRunFn := func(orderName string) (time.Time, error) {
-				if t, ok := latestFired[orderName]; ok && !t.IsZero() {
-					if a.Trigger == "cooldown" {
-						if interval, err := time.ParseDuration(a.Interval); err == nil && interval > 0 {
-							if now.Sub(t) < interval {
-								return t, nil
-							}
-						}
-					}
-				}
-				last, err := baseLastRunFn(orderName)
-				if err != nil {
-					lastRunErr = err
-				}
-				return last, err
-			}
+			lastRunFn, prov := newOrderCheckLastRunFn(a, now, latestFired, baseLastRunFn, &lastRunErr)
 			cursorFn := orders.CursorAcross(frontDoors)
 			if a.Trigger == "event" {
 				cursor, err := bdCursorAcrossStores(a.ScopedName(), rawOrderStores(typedStores)...)
@@ -1421,12 +1547,14 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 				result.DueTotal++
 			}
 			result.Orders = append(result.Orders, orderCheckJSONRow{
-				Name:       a.Name,
-				Rig:        a.Rig,
-				ScopedName: a.ScopedName(),
-				Trigger:    a.Trigger,
-				Due:        check.Due,
-				Reason:     check.Reason,
+				Name:          a.Name,
+				Rig:           a.Rig,
+				ScopedName:    a.ScopedName(),
+				Trigger:       a.Trigger,
+				Due:           check.Due,
+				Reason:        check.Reason,
+				LastRun:       orderCheckFormatLastRun(prov),
+				LastRunSource: orderCheckSourceOf(prov),
 			})
 		}
 		if writeCLIJSONLineOrExit(stdout, stderr, "gc order check", result) != 0 {
@@ -1440,9 +1568,9 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 
 	hasRig := anyOrderHasRig(aa)
 	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-12s %-15s %-5s %s\n", "NAME", "TRIGGER", "RIG", "DUE", "REASON") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-12s %-15s %-5s %-30s %-9s %s\n", "NAME", "TRIGGER", "RIG", "DUE", "LAST RUN", "SRC", "REASON") //nolint:errcheck
 	} else {
-		fmt.Fprintf(stdout, "%-20s %-12s %-5s %s\n", "NAME", "TRIGGER", "DUE", "REASON") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-12s %-5s %-30s %-9s %s\n", "NAME", "TRIGGER", "DUE", "LAST RUN", "SRC", "REASON") //nolint:errcheck
 	}
 	anyDue := false
 	for _, a := range aa {
@@ -1450,15 +1578,18 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 			fmt.Fprintf(stderr, "gc order check: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
+		// An inapplicable order is never evaluated, so it has no last run and
+		// no due verdict: it prints "-" in every numeric column to keep the
+		// row aligned under the LAST RUN / SRC header.
 		if backend, inapplicable := orderCheckInapplicable(cityPath, cfg, a); inapplicable {
 			if hasRig {
 				rig := a.Rig
 				if rig == "" {
 					rig = "-"
 				}
-				fmt.Fprintf(stdout, "%-20s %-12s %-15s %-5s %s\n", a.Name, a.Trigger, rig, "-", orderInapplicableLabel(backend)) //nolint:errcheck
+				fmt.Fprintf(stdout, "%-20s %-12s %-15s %-5s %-30s %-9s %s\n", a.Name, a.Trigger, rig, "-", "-", "-", orderInapplicableLabel(backend)) //nolint:errcheck
 			} else {
-				fmt.Fprintf(stdout, "%-20s %-12s %-5s %s\n", a.Name, a.Trigger, "-", orderInapplicableLabel(backend)) //nolint:errcheck
+				fmt.Fprintf(stdout, "%-20s %-12s %-5s %-30s %-9s %s\n", a.Name, a.Trigger, "-", "-", "-", orderInapplicableLabel(backend)) //nolint:errcheck
 			}
 			continue
 		}
@@ -1470,22 +1601,7 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 		frontDoors := orderFrontDoorsForTypedStores(typedStores)
 		baseLastRunFn := orders.LastRunAcross(frontDoors)
 		var lastRunErr error
-		lastRunFn := func(orderName string) (time.Time, error) {
-			if t, ok := latestFired[orderName]; ok && !t.IsZero() {
-				if a.Trigger == "cooldown" {
-					if interval, err := time.ParseDuration(a.Interval); err == nil && interval > 0 {
-						if now.Sub(t) < interval {
-							return t, nil
-						}
-					}
-				}
-			}
-			last, err := baseLastRunFn(orderName)
-			if err != nil {
-				lastRunErr = err
-			}
-			return last, err
-		}
+		lastRunFn, prov := newOrderCheckLastRunFn(a, now, latestFired, baseLastRunFn, &lastRunErr)
 		cursorFn := orders.CursorAcross(frontDoors)
 		if a.Trigger == "event" {
 			cursor, err := bdCursorAcrossStores(a.ScopedName(), rawOrderStores(typedStores)...)
@@ -1517,14 +1633,22 @@ func doOrderCheckWithStoresResolverScopedJSON(cityPath string, cfg *config.City,
 			due = "yes"
 			anyDue = true
 		}
+		lastRun := orderCheckFormatLastRun(prov)
+		if lastRun == "" {
+			lastRun = "-"
+		}
+		src := orderCheckSourceOf(prov)
+		if src == "" {
+			src = "-"
+		}
 		if hasRig {
 			rig := a.Rig
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-12s %-15s %-5s %s\n", a.Name, a.Trigger, rig, due, result.Reason) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-12s %-15s %-5s %-30s %-9s %s\n", a.Name, a.Trigger, rig, due, lastRun, src, result.Reason) //nolint:errcheck
 		} else {
-			fmt.Fprintf(stdout, "%-20s %-12s %-5s %s\n", a.Name, a.Trigger, due, result.Reason) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-12s %-5s %-30s %-9s %s\n", a.Name, a.Trigger, due, lastRun, src, result.Reason) //nolint:errcheck
 		}
 	}
 
