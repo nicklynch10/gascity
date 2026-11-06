@@ -29,19 +29,23 @@ import (
 const (
 	gateCreateRefused   = "create-refused:"
 	gateWorktreeRefused = "worktree-refused"
-	gateNameOccupied    = "name-occupied"
-	gateLivenessUnknown = "liveness-unknown"
-	gateQuarantine      = "startup-quarantine"
-	gateEndpointShut    = "endpoint-open"
-	gateProviderRed     = "provider-red"
-	gatePartial         = "partial"
-	gateTransport       = "transport-refused"
-	gateNoSlot          = "no-slot"
-	gateInFlight        = "in-flight"
-	gateNamedConflict   = "named-conflict"
-	gateOwnerPending    = "owner-pending"
-	gateNameHeld        = "name-held:"
-	gatePoolSlotShaped  = "named-identity-pool-slot-shaped"
+	// gateWorktreeOccupied: the request's work runs in a managed worktree a
+	// live session still runs in, so no second seat starts there. The item
+	// waits for the occupant to leave; the pass retries it next tick.
+	gateWorktreeOccupied = "worktree-occupied"
+	gateNameOccupied     = "name-occupied"
+	gateLivenessUnknown  = "liveness-unknown"
+	gateQuarantine       = "startup-quarantine"
+	gateEndpointShut     = "endpoint-open"
+	gateProviderRed      = "provider-red"
+	gatePartial          = "partial"
+	gateTransport        = "transport-refused"
+	gateNoSlot           = "no-slot"
+	gateInFlight         = "in-flight"
+	gateNamedConflict    = "named-conflict"
+	gateOwnerPending     = "owner-pending"
+	gateNameHeld         = "name-held:"
+	gatePoolSlotShaped   = "named-identity-pool-slot-shaped"
 )
 
 // Template causes of a custom scale_check: the template's own check failed;
@@ -499,14 +503,66 @@ func (p *decidePass) realizeRequest(bp *agentBuildParams, cfgAgent *config.Agent
 	switch {
 	case errors.Is(err, errPoolTriggerWorktreeEvidence):
 		p.refuseWork(qualifiedName, "", rowKey{}, request, err)
+		return
 	case err != nil:
 		p.refuse(qualifiedName, "", rowKey{}, planErrorCause(err))
+		return
+	}
+	// The worktree fence, after selection: a seat the pass would place in a
+	// managed worktree a live session still runs in gets no seat, reused or
+	// fresh. Legacy fences only the seats it passes over
+	// (poolSeatsElsewhere); a row of another pool, or one taking unbound
+	// work, is invisible there, and v2 selects over every census row
+	// (#8681's accepted shape, the gk-ofosp race).
+	if held := p.fence().occupiedByAnother(info, plan, request); held != nil {
+		// A fresh plan took its slot, and its share of the create budget,
+		// before this check: give both back, so the slot is not leaked.
+		bp.releasePoolPlan(plan, usedSlots)
+		p.refuseWorktreeOccupied(qualifiedName, request, held)
+		return
+	}
+	switch {
 	case plan != nil:
 		p.admitPoolPlan(cfgAgent, *plan, request)
 	case !used[info.ID]:
 		used[info.ID] = true
 		p.selectPoolRow(cfgAgent, info, slot, request)
 	}
+}
+
+// fence is the pass's worktree occupancy fence, built once: it reads the
+// liveness the pass already observed for every census row
+// (worktreeOccupantLive), so fencing a request costs no runtime probe.
+func (p *decidePass) fence() *poolWorktreeFence {
+	if p.worktreeFence == nil {
+		p.worktreeFence = &poolWorktreeFence{bp: p.bp, live: p.worktreeOccupantLive}
+	}
+	return p.worktreeFence
+}
+
+// worktreeOccupantLive reports whether the census row info is a live
+// occupant of the worktree it records: it is not gone, and not dead — a
+// corpse or a zombie holds nothing. Every other verdict, the unknown and
+// uncertain ones included, reads alive: this fence's job is to keep two live
+// sessions out of one checkout, so the doubtful row holds it (C2.9's
+// fail-closed reading). A row the pass has no observation of reads alive too.
+func (p *decidePass) worktreeOccupantLive(info session.Info) bool {
+	k, ok := p.censusKeyByID[info.ID]
+	if !ok {
+		return true
+	}
+	o := p.obs[k]
+	return o.Liveness != livenessGone && o.Liveness != livenessDead
+}
+
+// refuseWorktreeOccupied traces a request whose work runs in a managed
+// worktree a live session still runs in, naming the work item and the
+// occupant so the planner alerts it (observeWorktreeRefusals): the item gets
+// no seat for as long as that session stays.
+func (p *decidePass) refuseWorktreeOccupied(template string, request SessionRequest, err error) {
+	p.refuse(template, "", rowKey{}, gateWorktreeOccupied)
+	r := &p.trace[len(p.trace)-1]
+	r.WorkBeadID, r.Detail = strings.TrimSpace(request.WorkBeadID), err.Error()
 }
 
 // placeableName returns request, or, when it only names its seat
@@ -977,6 +1033,8 @@ func planErrorCause(err error) string {
 		return gateNoSlot
 	case errors.Is(err, errPoolTriggerWorktreeEvidence):
 		return gateWorktreeRefused
+	case errors.Is(err, errPoolWorktreeOccupied):
+		return gateWorktreeOccupied
 	}
 	return "plan-error"
 }

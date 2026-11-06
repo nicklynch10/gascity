@@ -178,9 +178,17 @@ type decidePass struct {
 	// duplicates, so a named session never resolves to whichever claimant
 	// sorts first (P3-1 obligation).
 	decidable []session.Info
+	// censusKeyByID maps every census row's session bead ID to its key, on
+	// every leg: the worktree fence reads a row's liveness by ID
+	// (worktreeOccupantLive).
+	censusKeyByID map[string]rowKey
 	// occupancy is every canonical census row, on every leg and in every
 	// class: what holds a slot or a name (C7.1).
 	occupancy []session.Info
+
+	// worktreeFence is the pass's worktree occupancy fence, built on first use
+	// (fence).
+	worktreeFence *poolWorktreeFence
 
 	merged      mergedDemand
 	named       namedSessionDemand
@@ -254,12 +262,13 @@ func newDecidePass(in allocInputs) *decidePass {
 			DecisionAt: in.Now,
 			Entries:    make(map[rowKey]*selectionEntry),
 		},
-		none:     make(map[rowKey]string),
-		byID:     make(map[string]rowKey),
-		index:    newPassIndex(),
-		standIns: make(map[string]string),
-		desired:  make(map[string]TemplateParams),
-		selected: make(map[rowKey]*selection),
+		none:          make(map[rowKey]string),
+		byID:          make(map[string]rowKey),
+		censusKeyByID: make(map[string]rowKey),
+		index:         newPassIndex(),
+		standIns:      make(map[string]string),
+		desired:       make(map[string]TemplateParams),
+		selected:      make(map[rowKey]*selection),
 	}
 	if c := p.in.Census; len(c.Legs) > 0 {
 		p.obs = observeCensus(in.Obs, c, in.Now, in.ObsMaxAge)
@@ -314,6 +323,11 @@ func (p *decidePass) classifyRows() {
 	p.managed = slices.Grow(p.managed, len(keys))
 	for _, k := range keys {
 		row := c.Rows[k]
+		// The same bead may be on two legs; the fence's liveness read is the
+		// sessions leg's row, which the census orders first.
+		if _, seen := p.censusKeyByID[row.Info.ID]; !seen {
+			p.censusKeyByID[row.Info.ID] = k
+		}
 		template := resolvedSessionTemplateInfo(row.Info, p.cfg)
 		e := &selectionEntry{
 			Key:      k,

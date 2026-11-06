@@ -1753,3 +1753,115 @@ func TestAllocator_RefusedNameMovesAReusedStartCandidateToThePoolDir(t *testing.
 		}
 	})
 }
+
+// TestAllocator_LiveSeatInTheWorksWorktreeRefusesASecondSeat pins v2's
+// worktree occupancy fence: a request whose work runs in a managed worktree a
+// live session still runs in gets no seat, and the refusal names the work
+// item so the planner alerts it. v2 is the default reconciler, and its
+// selection shares selectOrPlanPoolSessionBead with legacy, which fences only
+// around the seats it passes over (poolSeatsElsewhere): a row that is not a
+// pool seat of this pool — another pool's, or one taking unbound work — was
+// invisible, so two live sessions could land in one checkout (#8681's
+// accepted shape; the gk-ofosp race). A row that does not run in the worktree
+// never fences it, and neither does a dead one.
+//
+// Kills: no fence in v2 (two seats in one worktree); a fence that reads
+// liveness from the provider it does not have (poolSeatAlive is false with no
+// sp, so every occupant would read dead); a fence that refuses requests
+// placed outside a managed worktree; a fence built over the realize view
+// instead of the pass's params, whose realize memo narrows occupancy to one
+// agent and so hides every row of another pool.
+func TestAllocator_LiveSeatInTheWorksWorktreeRefusesASecondSeat(t *testing.T) {
+	const worktreePath = "/wt/w-1"
+	cfg := &config.City{Agents: []config.Agent{allocPoolAgent("worker", 3)}}
+	spec := worktree.Spec{BeadID: "w-1", StoreRef: "city", Path: worktreePath}
+	// fixture is one occupant row of the worker pool, running gc-z out of dir,
+	// and a request for w-1: the request can never reuse the occupant, so a
+	// seat it gets is a second one.
+	fixture := func(t *testing.T, dir string) *allocFixture {
+		occupant := poolRow("gc-1", "worker", 1, "active",
+			beadmeta.WorkDirMetadataKey, dir, beadmeta.TriggerBeadIDMetadataKey, "gc-z")
+		f := newAllocFixture(t, cfg).sessions(occupant).demand("worker", "w-1")
+		d := f.in.Demand.Collected.DefaultDemand["worker"]
+		d.WorktreeSpecs = map[string]*worktree.Spec{"w-1": &spec}
+		f.in.Demand.Collected.DefaultDemand["worker"] = d
+		// The occupant works gc-z, so w-1 cannot reuse its seat: it is a
+		// second seat the fence has to refuse, not the worktree's own.
+		f.in.Demand.AssignedWork = []beads.Bead{{ID: "gc-z", Status: "in_progress", Assignee: "gc-1"}}
+		return f
+	}
+	occupied := func(d allocDecision) bool {
+		if len(d.Plans) != 0 {
+			return false
+		}
+		for _, r := range d.Trace {
+			if r.WorkBeadID == "w-1" && strings.Contains(r.Detail, errPoolWorktreeOccupied.Error()) && strings.Contains(r.Detail, "gc-1") {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("live occupant", func(t *testing.T) {
+		f := fixture(t, worktreePath)
+		f.alive("s-gc-1", InventoryAttrs{})
+		if d := f.decide(); !occupied(d) {
+			t.Fatalf("plans %v trace %+v, want no seat and w-1 refused naming gc-1", d.Plans, d.Trace)
+		}
+	})
+	t.Run("dead occupant", func(t *testing.T) {
+		f := fixture(t, worktreePath)
+		f.corpse("s-gc-1")
+		if d := f.decide(); !slices.Equal(planWork(d), []string{"w-1"}) {
+			t.Fatalf("plans %v trace %+v, want w-1 planned once its occupant is dead", planWork(d), d.Trace)
+		}
+	})
+	t.Run("occupant elsewhere", func(t *testing.T) {
+		f := fixture(t, "/pools/worker")
+		f.alive("s-gc-1", InventoryAttrs{})
+		if d := f.decide(); !slices.Equal(planWork(d), []string{"w-1"}) {
+			t.Fatalf("plans %v trace %+v, want w-1 planned: no occupant runs in its worktree", planWork(d), d.Trace)
+		}
+	})
+	// The gk-ofosp shape: the occupant belongs to another pool. The v2 pass
+	// realizes one agent at a time, so this both pins that the fence is built
+	// over the pass's own params and not over the realize view, whose memo
+	// narrows occupancy to the requesting agent's slots — under that view the
+	// occupant is invisible and two live sessions land in one checkout.
+	t.Run("occupant of another pool", func(t *testing.T) {
+		cfg := &config.City{Agents: []config.Agent{allocPoolAgent("worker", 3), allocPoolAgent("other", 2)}}
+		occupant := poolRow("gc-1", "other", 1, "active",
+			beadmeta.WorkDirMetadataKey, worktreePath, beadmeta.TriggerBeadIDMetadataKey, "gc-z")
+		f := newAllocFixture(t, cfg).sessions(occupant).demand("worker", "w-1")
+		d := f.in.Demand.Collected.DefaultDemand["worker"]
+		d.WorktreeSpecs = map[string]*worktree.Spec{"w-1": &spec}
+		f.in.Demand.Collected.DefaultDemand["worker"] = d
+		f.in.Demand.AssignedWork = []beads.Bead{{ID: "gc-z", Status: "in_progress", Assignee: "gc-1"}}
+		f.alive("s-gc-1", InventoryAttrs{})
+		if d := f.decide(); !occupied(d) {
+			t.Fatalf("plans %v trace %+v, want no seat and w-1 refused naming gc-1", d.Plans, d.Trace)
+		}
+	})
+	// A refused plan took a concrete slot before the fence saw it. It must
+	// give the slot back, or the next work item in the same pass pays for one
+	// checkout's occupant with a gap in the pool.
+	t.Run("refused plan returns its slot", func(t *testing.T) {
+		f := fixture(t, worktreePath)
+		spec2 := worktree.Spec{BeadID: "w-2", StoreRef: "city", Path: "/wt/w-2"}
+		// demand replaces the entry, so the specs go back: both behave the
+		// same and land wherever the pass sends them.
+		f.demand("worker", "w-1", "w-2")
+		d := f.in.Demand.Collected.DefaultDemand["worker"]
+		d.WorktreeSpecs = map[string]*worktree.Spec{"w-1": &spec, "w-2": &spec2}
+		f.in.Demand.Collected.DefaultDemand["worker"] = d
+		f.alive("s-gc-1", InventoryAttrs{})
+		got := f.decide()
+		if !slices.Equal(planWork(got), []string{"w-2"}) {
+			t.Fatalf("plans %v trace %+v, want only w-2 planned", planWork(got), got.Trace)
+		}
+		// Slot 1 is the occupant's; w-1's refusal must not push w-2 to 3.
+		if slots := planSlots(got, "worker"); !slices.Equal(slots, []int{2}) {
+			t.Fatalf("slots %v, want w-2 in slot 2: the refused plan gave its slot back", slots)
+		}
+	})
+}

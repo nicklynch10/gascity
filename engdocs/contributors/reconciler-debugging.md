@@ -85,11 +85,19 @@ on the old `Stopped drain-acked session` stdout line. Use `.gc/events.jsonl`
 and the trace `operation` records as the durable signal, with stdout/stderr as
 supporting diagnostics only.
 
-Under the v2 reconciler, a pool work item refused because its worktree
-evidence (`gc.work_dir` / `gc.worktree_*`) is unusable does not show in the
-template trace. Look for a `reconciler.alert` of kind `worktree-refused`
-whose subject is the work bead in `.gc/events.jsonl`, or the matching
-`v2 planner: alert worktree-refused:` line on controller stderr.
+Under the v2 reconciler, a pool work item refused for a worktree reason does
+not show in the template trace. Look for a `reconciler.alert` whose subject is
+the work bead in `.gc/events.jsonl`, or the matching `v2 planner: alert
+<kind>:` line on controller stderr. Two kinds report it, and which one tells
+you what to do next:
+
+- `worktree-refused` — the item's worktree evidence (`gc.work_dir` /
+  `gc.worktree_*`) is unusable: incomplete, or naming another bead or store.
+  Fix the evidence.
+- `worktree-occupied` — the evidence is fine, but a live session still runs in
+  the managed worktree the work belongs to, so no second seat is placed there
+  (one checkout, one live session). Nothing is wrong with the item: it starts
+  once that session leaves.
 
 ## Rig-Scoped Convergence Rollback
 

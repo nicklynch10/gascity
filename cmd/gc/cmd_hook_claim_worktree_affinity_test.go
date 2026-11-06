@@ -466,7 +466,9 @@ func countingSeatProbe(answer bool, calls *int) func(string) (bool, error) {
 // The controller started this seat inside r1-a's verified worktree for r1-a,
 // and work bound to no worktree (r1-u) sits ahead of r1-a in the routed window.
 // The seat must leave r1-u: it would run in r1-a's checkout, on r1-a's branch,
-// while r1-a's demand starts a second seat in the same worktree.
+// and the worktree fence keeps r1-a's own seat out while this one lives there
+// (errPoolWorktreeOccupied), so one checkout would run one session on the
+// other's work.
 func TestHookClaimSeatInVerifiedWorktreeLeavesUnboundWork(t *testing.T) {
 	var claimed, reclaimed []string
 	ops := affinityClaimOps(t, []beads.Bead{

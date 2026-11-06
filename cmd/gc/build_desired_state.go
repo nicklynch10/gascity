@@ -4195,6 +4195,11 @@ func realizePoolDesiredSessionsAt(
 				switch {
 				case errors.Is(err, errPoolSeatRunsElsewhere):
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (retrying next tick)\n", qualifiedName, err) //nolint:errcheck
+				case errors.Is(err, errPoolWorktreeOccupied):
+					// The worktree is a live session's until it leaves: nothing
+					// in this pool can shorten the wait, so the request retries
+					// rather than starting a second seat in one checkout.
+					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (retrying once its occupant leaves)\n", qualifiedName, err) //nolint:errcheck
 				case errors.Is(err, errPoolSessionCreateBudgetExhausted):
 					fmt.Fprintf(stderr, "buildDesiredState: pool %q request: %v (fresh create deferred)\n", qualifiedName, err) //nolint:errcheck
 				case errors.Is(err, errPoolSessionCreatePartial):

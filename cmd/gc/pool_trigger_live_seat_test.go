@@ -85,19 +85,30 @@ type liveSeatReuse struct {
 	extra    map[string]string
 	request  func(id string) SessionRequest
 	assigned func(id string) []beads.Bead
+	// unobservable makes the provider's liveness observation fail.
+	unobservable bool
+}
+
+// unobservableProbe is a fake whose liveness observation fails, as a provider
+// that cannot be reached does.
+type unobservableProbe struct{ *runtime.Fake }
+
+func (unobservableProbe) ObserveLivenessWithError(string, []string) (runtime.Liveness, error) {
+	return runtime.Liveness{}, errors.New("provider unreachable")
 }
 
 type liveSeatReuseResult struct {
-	store      beads.Store
-	sp         *runtime.Fake
-	cityPath   string
-	id         string
-	seatName   string
-	occupantID string
-	cfg        *config.City
-	request    SessionRequest
-	assigned   []beads.Bead
-	partial    bool
+	store        beads.Store
+	sp           *runtime.Fake
+	cityPath     string
+	id           string
+	seatName     string
+	occupantID   string
+	cfg          *config.City
+	request      SessionRequest
+	assigned     []beads.Bead
+	partial      bool
+	unobservable bool
 	// base is the desired set realization computed, before the session
 	// overlay (DesiredStateResult.BaseState); desired includes the overlay.
 	base    map[string]TemplateParams
@@ -150,6 +161,7 @@ func (r liveSeatReuse) run(t *testing.T) liveSeatReuseResult {
 	res := liveSeatReuseResult{
 		store: store, sp: runtime.NewFake(), cityPath: t.TempDir(), id: seat.ID, seatName: seatName,
 		cfg: liveSeatAgent(t, 0, maxSessions), request: r.request(seat.ID), partial: r.partial,
+		unobservable: r.unobservable,
 	}
 	if r.oneShot {
 		res.cfg.Agents[0].Lifecycle = config.AgentLifecycleOneShot
@@ -211,7 +223,11 @@ func (res *liveSeatReuseResult) realize(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
-	bp := newAgentBuildParams("test-city", res.cityPath, res.cfg, res.sp, time.Now().UTC(), res.store, &stderr)
+	sp := runtime.Provider(res.sp)
+	if res.unobservable {
+		sp = unobservableProbe{res.sp}
+	}
+	bp := newAgentBuildParams("test-city", res.cityPath, res.cfg, sp, time.Now().UTC(), res.store, &stderr)
 	bp.sessionBeads = snapshot
 	bp.assignedWorkBeads = res.assigned
 	if res.partial {
@@ -1218,4 +1234,127 @@ func TestPoolSeatLeaving(t *testing.T) {
 			t.Fatal("a draining seat holding assigned work is leaving; want it kept")
 		}
 	})
+}
+
+// A live seat that runs in a bead's managed worktree while working another
+// bead keeps that worktree to itself. The bead's work is not handed a second
+// seat there, which would put two live sessions in one checkout on one
+// branch at the same time (the gk-ofosp race: a recycled bead's worktree
+// still held a live --resume'd session when the bead came back to the pool).
+// The work waits for the occupant to leave, and nothing is started.
+func TestLegacyLiveSeatOccupyingTheWorksWorktreeBlocksASecondSeat(t *testing.T) {
+	specA, pathA := liveSeatManagedSpec(t, "gc-a")
+	res := liveSeatReuse{
+		seatDir: pathA, running: true,
+		// The seat is working gc-z from inside gc-a's worktree.
+		extra: map[string]string{beadmeta.TriggerBeadIDMetadataKey: "gc-z"},
+		assigned: func(id string) []beads.Bead {
+			return []beads.Bead{workBead("gc-z", "worker", id, "in_progress", 1)}
+		},
+		request: newDemand(SessionRequest{Tier: "new", WorkBeadID: "gc-a", WorkStoreRef: "rig:r1", WorktreeSpec: &specA}),
+	}.run(t)
+	if rows := res.otherRows(t); len(rows) != 0 {
+		t.Fatalf("started %d sessions beside the live seat in %s; want none", len(rows), pathA)
+	}
+	if !strings.Contains(res.stderr, errPoolWorktreeOccupied.Error()) {
+		t.Fatalf("stderr = %q; want it to name %q", res.stderr, errPoolWorktreeOccupied)
+	}
+	for _, want := range []string{res.id, pathA, "gc-a"} {
+		if !strings.Contains(res.stderr, want) {
+			t.Fatalf("stderr = %q; want it to name %q", res.stderr, want)
+		}
+	}
+	// The occupant keeps its own row: the work it runs, and its directory.
+	row := res.row(t)
+	if got := row.Metadata[beadmeta.TriggerBeadIDMetadataKey]; got != "gc-z" {
+		t.Fatalf("occupant trigger = %q; want gc-z, the seat never re-pointed", got)
+	}
+	if got := row.Metadata[beadmeta.WorkDirMetadataKey]; got != pathA {
+		t.Fatalf("occupant gc.work_dir = %q; want %q", got, pathA)
+	}
+}
+
+// The fence lasts only while the occupant runs. Once its runtime is gone the
+// worktree is free, and the work gets a fresh seat in it.
+func TestLegacyOccupiedWorktreeFreesWhenTheOccupantStops(t *testing.T) {
+	specA, pathA := liveSeatManagedSpec(t, "gc-a")
+	res := liveSeatReuse{
+		seatDir: pathA, running: true,
+		extra: map[string]string{beadmeta.TriggerBeadIDMetadataKey: "gc-z"},
+		assigned: func(id string) []beads.Bead {
+			return []beads.Bead{workBead("gc-z", "worker", id, "in_progress", 1)}
+		},
+		request: newDemand(SessionRequest{Tier: "new", WorkBeadID: "gc-a", WorkStoreRef: "rig:r1", WorktreeSpec: &specA}),
+	}.run(t)
+	if rows := res.otherRows(t); len(rows) != 0 {
+		t.Fatalf("started %d sessions beside the live seat; want none", len(rows))
+	}
+	if err := res.sp.Stop(res.seatName); err != nil {
+		t.Fatal(err)
+	}
+	res.realize(t)
+	res.freshSession(t, "gc-a", pathA)
+}
+
+// A live seat that already runs in the work's worktree is that worktree's one
+// seat: it is reused for the work in place, not duplicated beside.
+func TestLegacyOccupantIsReusedRatherThanDuplicated(t *testing.T) {
+	specA, pathA := liveSeatManagedSpec(t, "gc-a")
+	res := liveSeatReuse{
+		seatDir: pathA, running: true,
+		extra:   map[string]string{beadmeta.TriggerBeadIDMetadataKey: "gc-z"},
+		request: newDemand(SessionRequest{Tier: "new", WorkBeadID: "gc-a", WorkStoreRef: "rig:r1", WorktreeSpec: &specA}),
+	}.reused(t)
+	if rows := res.otherRows(t); len(rows) != 0 {
+		t.Fatalf("started %d sessions beside the reused occupant; want none", len(rows))
+	}
+	row := res.row(t)
+	if got := row.Metadata[beadmeta.TriggerBeadIDMetadataKey]; got != "gc-a" {
+		t.Fatalf("trigger = %q; want gc-a, the occupant took the work in place", got)
+	}
+	if got := row.Metadata[beadmeta.WorkDirMetadataKey]; got != pathA {
+		t.Fatalf("gc.work_dir = %q; want %q kept", got, pathA)
+	}
+}
+
+// An occupant whose liveness cannot be observed may still run there, so it
+// still fences: the work waits rather than racing a seat that might be live.
+func TestLegacyUnobservableOccupantStillFences(t *testing.T) {
+	specA, pathA := liveSeatManagedSpec(t, "gc-a")
+	res := liveSeatReuse{
+		seatDir: pathA, running: true,
+		extra: map[string]string{beadmeta.TriggerBeadIDMetadataKey: "gc-z"},
+		assigned: func(id string) []beads.Bead {
+			return []beads.Bead{workBead("gc-z", "worker", id, "in_progress", 1)}
+		},
+		request: newDemand(SessionRequest{Tier: "new", WorkBeadID: "gc-a", WorkStoreRef: "rig:r1", WorktreeSpec: &specA}),
+	}.run(t)
+	res.unobservable = true
+	res.realize(t)
+	if rows := res.otherRows(t); len(rows) != 0 {
+		t.Fatalf("started %d sessions on an unobservable occupant; want none", len(rows))
+	}
+}
+
+// TestPoolSeatLiveByProbeFailsClosed pins the fence's default liveness read on
+// its unobservable cases. The fence's contract is fail-closed, but the
+// underlying probe answers a different question (is this seat safe to
+// re-point), where an unreadable seat reads NOT alive. Wired together
+// directly, a build with no provider or a row with no runtime name would
+// report "no occupant" and let a second seat into a checkout that may still
+// be edited.
+func TestPoolSeatLiveByProbeFailsClosed(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	row := func(name string) session.Info {
+		return session.Info{ID: "gc-1", Template: "worker", SessionNameMetadata: name, WorkDir: "/wt/w-1"}
+	}
+	bp := &agentBuildParams{city: cfg, cityPath: "/city"}
+	if !poolSeatLiveByProbe(bp, nil)(row("s-gc-1")) {
+		t.Error("a build with no provider read its occupant dead, want alive (fail closed)")
+	}
+	sp := runtime.NewFake()
+	bp.sp = sp
+	if !poolSeatLiveByProbe(bp, nil)(row("")) {
+		t.Error("a row with no runtime name read dead, want alive (fail closed): the checkout may still be edited")
+	}
 }

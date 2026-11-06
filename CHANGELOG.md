@@ -1222,6 +1222,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A managed worktree gets one live session at a time.** Work whose
+  worktree was recycled kept getting a second seat started in it while the
+  session already running there still held the checkout, so two agents
+  worked one branch and one edited the other's files (the gk-ofosp race).
+  Selection fenced each request's worktree only against the seats that pool
+  could itself reuse, so a row of another pool, or one that had taken unbound
+  work, was invisible; the accepted shape was written into the #8681 test.
+  Both reconcilers now refuse to place a seat — reused or fresh — in a
+  managed worktree an open session still runs in, and the request waits for
+  that session to go, retried next tick. Under the default (v2) reconciler
+  the refusal is traced as `worktree-occupied` and alerted once per work
+  item, like `worktree-refused`; a fresh plan's slot and create-budget share
+  go back when it is refused. An occupant whose liveness cannot be observed
+  holds its worktree (fail closed); a dead one does not.
+
 - **Adopting or restarting with a bd store bound to a loopback Dolt server
   gc does not run works.** A store `bd init --server --external` bound to a
   dolt sql-server on `127.0.0.1`/`localhost`/`::1` was classified as gc's own

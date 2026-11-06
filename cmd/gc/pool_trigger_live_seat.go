@@ -20,6 +20,39 @@ import (
 // (poolSeatsElsewhere.freeSlot).
 var errPoolSeatRunsElsewhere = errors.New("work left for a session in its own directory")
 
+// errPoolWorktreeOccupied marks a request whose work runs in a managed
+// worktree a live session still runs in. That worktree is that session's until
+// it leaves: a second seat started there would put two live sessions in one
+// checkout on one branch, each editing the other's work. The request waits for
+// the occupant to go (selectOrPlanPoolSessionBeadAvoiding,
+// poolWorktreeOccupiedError), and the reconciler retries it next tick.
+var errPoolWorktreeOccupied = errors.New("worktree held by a live session")
+
+// poolWorktreeOccupied is a managed worktree a request's work runs in and the
+// live sessions that still run inside it, by session bead ID.
+type poolWorktreeOccupied struct {
+	// WorkDir is the work's verified managed worktree.
+	WorkDir string
+	// Seats are the open sessions whose row places them in WorkDir and whose
+	// agent is alive, whether or not they are this pool's seats: the checkout
+	// is theirs to edit whatever they are working.
+	Seats []string
+}
+
+// poolWorktreeOccupiedError is errPoolWorktreeOccupied for one request: the
+// worktree, the live sessions in it, and the trigger bead whose work waits.
+type poolWorktreeOccupiedError struct {
+	at     poolWorktreeOccupied
+	workID string
+}
+
+func (e *poolWorktreeOccupiedError) Error() string {
+	return fmt.Sprintf("%v: session %s runs in %s, where trigger bead %s's work runs; no second seat starts there",
+		errPoolWorktreeOccupied, strings.Join(e.at.Seats, ", "), e.at.WorkDir, e.workID)
+}
+
+func (e *poolWorktreeOccupiedError) Unwrap() error { return errPoolWorktreeOccupied }
+
 // poolSeatElsewhere is a live pool seat whose directory is not the one the
 // controller places a request's work in.
 type poolSeatElsewhere struct {
@@ -133,6 +166,114 @@ func (e *poolSeatRunsElsewhereError) Unwrap() []error {
 	return []error{errPoolSeatRunsElsewhere, e.cause}
 }
 
+// releasePoolPlan gives back what a refused fresh selection reserved: the
+// plan's concrete slot, and its share of the pool create budget.
+// planFreshPoolSessionBead claims the budget only after it has taken the slot,
+// so a plan's existence means both are held: the caller gives both back or
+// leaks both, and the pass is not budgeted anyway (admission takes plans in
+// fair-share order, so a held share would only starve the next tick's creates
+// for no gain). A selection that reused a row carries no plan and holds no
+// budget share; the slot it claimed (claimDesiredPoolSlotInfo) is the row's
+// own, and stays claimed so no fresh plan is named into it while the row
+// exists.
+func (bp *agentBuildParams) releasePoolPlan(plan *poolSessionCreatePlan, usedSlots map[int]bool) {
+	if bp == nil || plan == nil {
+		return
+	}
+	delete(usedSlots, plan.slot)
+	bp.releasePoolSessionCreate()
+}
+
+// poolSessionRunsIn reports whether the open session info's row places it in
+// dir: the directory its process runs in, resolved against cityPath as the
+// controller resolves a recorded work dir. An empty recorded directory names
+// none.
+func poolSessionRunsIn(cityPath string, info session.Info, dir string) bool {
+	recorded := preparedStartSessionWorkDir(info)
+	if recorded == "" || dir == "" {
+		return false
+	}
+	return pathutil.SamePath(resolveWorkDirAgainstCity(cityPath, recorded), dir)
+}
+
+// poolOccupantInfos is the rows a worktree occupancy check reads: the build's
+// cross-store occupancy census, which holds rows the pool's own snapshot does
+// not, such as a session another store's leg reports, together with the
+// build's own session snapshot, which holds the seats this build has placed;
+// the census alone for a build with no snapshot.
+//
+// The fence is built over a pass's or a pool's params, never over the v2
+// realize view: that view's realize memo narrows freshPoolOccupancyInfos to
+// one agent's slots, and another pool's seat in the same checkout is exactly
+// what this must see (the "occupant of another pool" case of
+// TestAllocator_LiveSeatInTheWorksWorktreeRefusesASecondSeat).
+func poolOccupantInfos(bp *agentBuildParams) []session.Info {
+	if bp == nil {
+		return nil
+	}
+	if bp.sessionBeads == nil {
+		return bp.sessionOccupancyInfos
+	}
+	return freshPoolOccupancyInfos(bp)
+}
+
+// poolWorktreeOccupiedBy returns the open sessions that run in the managed
+// worktree dir: every row the build knows whose recorded directory is dir and
+// which live reports alive. A row that is not a pool seat counts too — a
+// checkout is held whatever its occupant is working, and by whichever pool it
+// belongs to. live decides each row's liveness, and it must fail closed: a row
+// it cannot observe counts as alive.
+func poolWorktreeOccupiedBy(bp *agentBuildParams, dir string, live func(session.Info) bool) []string {
+	if bp == nil || dir == "" || live == nil {
+		return nil
+	}
+	var seats []string
+	for _, info := range poolOccupantInfos(bp) {
+		if !poolSessionRunsIn(bp.cityPath, info, dir) {
+			continue
+		}
+		if !live(info) {
+			continue
+		}
+		seats = append(seats, info.ID)
+	}
+	return seats
+}
+
+// poolSeatLiveByProbe is poolWorktreeOccupiedBy's default live: the row's
+// agent is alive as the reconciler observes it, with the process names of the
+// agent its row's template names (poolSeatProcessNames), so a pane whose agent
+// died does not hold a checkout. It fails closed, as the fence requires: an
+// observation that fails (poolSeatAliveAs), a row with no runtime name to
+// probe, and a build with no provider to probe it with all read alive, since
+// the checkout may still be edited.
+func poolSeatLiveByProbe(bp *agentBuildParams, cfgAgent *config.Agent) func(session.Info) bool {
+	return func(info session.Info) bool {
+		// poolSeatAlive answers "may this seat be re-pointed", where an
+		// unobservable seat reads not-alive. The fence asks the opposite
+		// question about the same observation, so the cases it cannot read
+		// are held rather than ignored.
+		if bp == nil || bp.sp == nil || strings.TrimSpace(info.SessionNameMetadata) == "" {
+			return true
+		}
+		return poolSeatAlive(bp, poolSeatConfigAgent(bp, cfgAgent, info), info)
+	}
+}
+
+// poolSeatConfigAgent is the agent a row's liveness is observed with: the
+// configured agent its template names, else fallback. The row may be another
+// pool's seat, or the agent its own row names may be gone from the config.
+func poolSeatConfigAgent(bp *agentBuildParams, fallback *config.Agent, info session.Info) *config.Agent {
+	template := resolvedSessionTemplateInfo(info, reuseTemplateConfig(bp))
+	if template == "" {
+		return fallback
+	}
+	if cfg := findAgentByTemplate(reuseTemplateConfig(bp), template); cfg != nil {
+		return cfg
+	}
+	return fallback
+}
+
 // poolSeatsElsewhere selects and plans, for one legacy realization of a pool,
 // around the live seats a request would re-point at work placed elsewhere
 // (poolSeatPlacedElsewhere and poolSeatAlive), observing each seat at most
@@ -146,10 +287,16 @@ type poolSeatsElsewhere struct {
 	alive        map[string]bool
 	processNames []string
 	resolved     bool
+	// fence refuses a selection that would put a session in a managed
+	// worktree a live one still runs in. It shares this selection's liveness
+	// read, so a seat is observed once however it is asked about.
+	fence *poolWorktreeFence
 }
 
 func newPoolSeatsElsewhere(bp *agentBuildParams, cfgAgent *config.Agent, template string) *poolSeatsElsewhere {
-	return &poolSeatsElsewhere{bp: bp, cfgAgent: cfgAgent, template: template, alive: map[string]bool{}}
+	s := &poolSeatsElsewhere{bp: bp, cfgAgent: cfgAgent, template: template, alive: map[string]bool{}}
+	s.fence = &poolWorktreeFence{bp: bp, cfgAgent: cfgAgent, live: s.isAlive}
+	return s
 }
 
 // selectOrPlan is selectOrPlanPoolSessionBeadAvoiding for request, passing
@@ -158,10 +305,83 @@ func newPoolSeatsElsewhere(bp *agentBuildParams, cfgAgent *config.Agent, templat
 // adds the seats retired to the error.
 func (s *poolSeatsElsewhere) selectOrPlan(preferred *session.Info, request SessionRequest, decisionTime time.Time, used map[string]bool, usedSlots map[int]bool) (session.Info, int, *poolSessionCreatePlan, error) {
 	info, slot, plan, err := selectOrPlanPoolSessionBeadAvoiding(s.bp, s.cfgAgent, s.template, preferred, request, decisionTime, used, usedSlots, s.forRequest(request, used))
+	if held := s.fence.occupiedByAnother(info, plan, request); held != nil {
+		// The selection would put a session in a worktree a live one still
+		// runs in. Nothing about the pool can free that: the occupant is not
+		// this pool's to retire, and it leaves when its own work ends. The
+		// plan's reservation goes back so a later request, or the next tick,
+		// can use the slot.
+		s.bp.releasePoolPlan(plan, usedSlots)
+		return session.Info{}, 0, nil, held
+	}
 	if retired := s.freeSlot(request, err, used); len(retired) > 0 {
 		err = fmt.Errorf("%w; freeing a slot: session %s leaves the desired set", err, strings.Join(retired, ", "))
 	}
 	return info, slot, plan, err
+}
+
+// poolWorktreeFence holds one selection's view of which managed worktrees a
+// live session still runs in. It is shared by both reconcilers: legacy builds
+// it per pool (poolSeatsElsewhere), v2 per agent's realization, over the
+// liveness its census pass already read, so neither observes a seat twice.
+type poolWorktreeFence struct {
+	bp       *agentBuildParams
+	cfgAgent *config.Agent
+	// live decides an occupant's liveness (poolWorktreeOccupiedBy). It must
+	// fail closed: a row it cannot observe counts as alive. Nil reads the
+	// runtime (poolSeatLiveByProbe).
+	live func(session.Info) bool
+	// occupied caches each work dir's occupancy by path, so the requests for
+	// one worktree probe its occupants once.
+	occupied map[string]poolWorktreeOccupied
+}
+
+// occupiedByAnother reports the worktree a selection would put a session into
+// that a live session still runs in, or nil. A selection that keeps a seat in
+// the worktree it runs in is that worktree's own seat, not another: there is
+// one live session there either way. Every other selection — a fresh seat
+// planned in the work's worktree, or a seat moved into it — is refused while an
+// occupant runs there, whatever pool it belongs to. Work bound to no managed
+// worktree is never affected: it is placed in the pool's own directory, which
+// no worktree fence owns.
+func (f *poolWorktreeFence) occupiedByAnother(info session.Info, plan *poolSessionCreatePlan, request SessionRequest) *poolWorktreeOccupiedError {
+	if f == nil || f.bp == nil || request.WorktreeSpec == nil {
+		return nil
+	}
+	workDir := strings.TrimSpace(request.WorktreeSpec.Path)
+	if workDir == "" {
+		return nil
+	}
+	live := f.live
+	if live == nil {
+		live = poolSeatLiveByProbe(f.bp, f.cfgAgent)
+	}
+	// A live selected row that already runs in the worktree keeps its seat:
+	// the selection places no new session there, so there is nothing to
+	// refuse, and whatever else runs beside it is not this request's doing.
+	if plan == nil && info.ID != "" && poolSessionRunsIn(f.bp.cityPath, info, workDir) && live(info) {
+		return nil
+	}
+	all, cached := f.occupied[workDir]
+	if !cached {
+		if f.occupied == nil {
+			f.occupied = map[string]poolWorktreeOccupied{}
+		}
+		all = poolWorktreeOccupied{WorkDir: workDir, Seats: poolWorktreeOccupiedBy(f.bp, workDir, live)}
+		f.occupied[workDir] = all
+	}
+	// The cache is the worktree's occupants, whoever asked: the selected row
+	// itself is not one of the rows it must be placed beside.
+	at := poolWorktreeOccupied{WorkDir: all.WorkDir}
+	for _, id := range all.Seats {
+		if id != info.ID {
+			at.Seats = append(at.Seats, id)
+		}
+	}
+	if len(at.Seats) == 0 {
+		return nil
+	}
+	return &poolWorktreeOccupiedError{at: at, workID: request.WorkBeadID}
 }
 
 // forRequest returns, by session ID, the live seats a selection for request

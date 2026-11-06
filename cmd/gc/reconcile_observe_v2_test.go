@@ -199,8 +199,9 @@ func TestAmbiguousCreateBoundClearAlerts(t *testing.T) {
 
 // TestV2AlertsOncePerEpisode pins each recurring alert to once per episode:
 // a run of panicking passes, a row's unknown state, a named duplicate, a
-// boot gate closed for longer than 2 × patrol, and a work item refused for
-// unusable worktree evidence (once per item and cause while it lasts).
+// boot gate closed for longer than 2 × patrol, a work item refused for
+// unusable worktree evidence, and one refused because a live session still
+// holds its managed worktree (each once per item and cause while it lasts).
 //
 // Kills: an alert storm at the pass rate, an episode that ends without
 // re-arming its alert, a worktree refusal deduped without its cause, and an
@@ -292,6 +293,24 @@ func TestV2AlertsOncePerEpisode(t *testing.T) {
 		}
 		if got := f.alerts(t); len(got) != 4 || got[0] != alertWorktreeRefused {
 			t.Errorf("alert kinds = %v, want four %s", got, alertWorktreeRefused)
+		}
+	})
+	t.Run("worktree occupied", func(t *testing.T) {
+		f := newObserveFixture(t)
+		occupied := allocTraceRecord{Template: "worker", Reason: "ineligible:" + gateWorktreeOccupied,
+			WorkBeadID: "w-1", Detail: "session s-gc-1 runs in /wt/w-1"}
+		f.p.observeWorktreeRefusals([]allocTraceRecord{occupied})
+		f.p.observeWorktreeRefusals([]allocTraceRecord{occupied})
+		// The occupant left, but the evidence is now unusable: a different
+		// wait, so a new kind, not the same episode.
+		f.p.observeWorktreeRefusals([]allocTraceRecord{{Template: "worker",
+			Reason: "ineligible:" + gateWorktreeRefused, WorkBeadID: "w-1", Detail: "missing gc.worktree_root"}})
+		if got := f.alerts(t); !slices.Equal(got, []string{alertWorktreeOccupied, alertWorktreeRefused}) {
+			t.Errorf("alert kinds = %v, want one %s over two passes then one %s",
+				got, alertWorktreeOccupied, alertWorktreeRefused)
+		}
+		if e := f.ev.Events[0]; !strings.Contains(e.Message, "occupant runs") || !strings.Contains(e.Message, "s-gc-1") {
+			t.Errorf("alert message = %q, want the occupant and the worktree's seat", e.Message)
 		}
 	})
 }

@@ -49,6 +49,10 @@ const (
 	// worktree evidence it found unusable (C6.5(a)); no create effect ever
 	// sees the request, so this alert is all that reports the starved item.
 	alertWorktreeRefused = "worktree-refused"
+	// alertWorktreeOccupied: the allocation refuses a pool work item whose
+	// managed worktree a live session still runs in. Its evidence is fine, so
+	// it is not a worktree-refused alert: what waits is the occupant's exit.
+	alertWorktreeOccupied = "worktree-occupied"
 )
 
 // healRefusalsBeforeAlert is how many backed-off refusals in a row an A6 heal
@@ -66,7 +70,7 @@ type passObserver struct {
 	gateAlerted     bool
 	duplicates      map[string]bool   // the last pass's named-duplicate alerts
 	unknown         map[rowKey]string // rows alerted for an unknown state, with it
-	worktreeRefused map[string]string // work items alerted for unusable worktree evidence, with the alert
+	worktreeRefused map[string]string // work items alerted for a worktree refusal, with the alert
 	lastKey         string
 	lastEmit        time.Time
 	identity        identityObserver // arm A3's alerts (reconcile_observe_identity.go)
@@ -263,9 +267,11 @@ func (p *planner) observeWorld(w *World, duplicates []string, c *passCounts) {
 }
 
 // observeWorktreeRefusals alerts once on each work item the allocation
-// refused for unusable worktree evidence (allocTraceRecord.WorkBeadID), for
-// as long as the refusal lasts: a changed pool or cause alerts again, and an
-// item the pass no longer refuses is forgotten, so a relapse alerts again.
+// refused for a worktree reason (allocTraceRecord.WorkBeadID), for as long as
+// the refusal lasts: a changed pool or cause alerts again, and an item the
+// pass no longer refuses is forgotten, so a relapse alerts again. Unusable
+// evidence and a live occupant are separate kinds, because they are separate
+// waits: the first needs the evidence fixed, the second the occupant to go.
 func (p *planner) observeWorktreeRefusals(trace []allocTraceRecord) {
 	refused := make(map[string]string)
 	for _, r := range trace {
@@ -275,10 +281,15 @@ func (p *planner) observeWorktreeRefusals(trace []allocTraceRecord) {
 		if _, seen := refused[r.WorkBeadID]; seen {
 			continue
 		}
-		msg := fmt.Sprintf("work bead %s gets no %q session while its worktree evidence is unusable: %s", r.WorkBeadID, r.Template, r.Detail)
+		kind, msg := alertWorktreeRefused,
+			fmt.Sprintf("work bead %s gets no %q session while its worktree evidence is unusable: %s", r.WorkBeadID, r.Template, r.Detail)
+		if r.Reason == "ineligible:"+gateWorktreeOccupied {
+			kind = alertWorktreeOccupied
+			msg = fmt.Sprintf("work bead %s gets no %q session while its worktree's occupant runs: %s", r.WorkBeadID, r.Template, r.Detail)
+		}
 		refused[r.WorkBeadID] = msg
 		if p.obs.worktreeRefused[r.WorkBeadID] != msg {
-			p.alert(alertWorktreeRefused, r.WorkBeadID, msg)
+			p.alert(kind, r.WorkBeadID, msg)
 		}
 	}
 	p.obs.worktreeRefused = refused
